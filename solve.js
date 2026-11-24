@@ -10,14 +10,14 @@ const MONTHS = [
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
 function esc(s) {
+  if (!/[&<>"']/.test(s)) return s;
   return s.replace(/[&<>"']/g, (c) => ESC_MAP[c]);
 }
 
 function slugify(text) {
-  let s = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  s = s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  let s = text.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase();
   s = s.replace(/[^a-z0-9]+/g, '-');
-  s = s.replace(/^-+/, '').replace(/-+$/, '');
+  s = s.replace(/^-+|-+$/g, '');
   if (s.length > 64) {
     s = s.slice(0, 64);
     if (s.endsWith('-')) s = s.slice(0, -1);
@@ -124,7 +124,7 @@ function parseFrontMatter(content) {
     fm[k] = val.value;
   }
   if (fm.title === undefined) return { error: 'no title' };
-  return { fm, body: lines.slice(close + 1).join('\n') };
+  return { fm, bodyLines: lines.slice(close + 1) };
 }
 
 function uniqueSlug(base, used) {
@@ -235,6 +235,21 @@ function renderInline(text, lx) {
   let i = 0;
   const n = text.length;
   while (i < n) {
+    // copy a run of plain text up to the next special char in one go
+    let j = n;
+    const k1 = text.indexOf('\\', i);
+    if (k1 >= 0 && k1 < j) j = k1;
+    const k2 = text.indexOf('`', i);
+    if (k2 >= 0 && k2 < j) j = k2;
+    const k3 = text.indexOf('*', i);
+    if (k3 >= 0 && k3 < j) j = k3;
+    const k4 = text.indexOf('[', i);
+    if (k4 >= 0 && k4 < j) j = k4;
+    if (j > i) {
+      out += esc(text.slice(i, j));
+      i = j;
+      continue;
+    }
     const c = text[i];
     if (c === '\\' && i + 1 < n && ESCAPABLES.has(text[i + 1])) {
       const ch = text[i + 1];
@@ -295,8 +310,7 @@ function renderInline(text, lx) {
   return out;
 }
 
-function renderMarkdown(body, lx) {
-  const lines = body.split('\n');
+function renderMarkdown(lines, lx) {
   const blocks = [];
   const toc = [];
   const headingIds = new Set();
@@ -429,19 +443,19 @@ function stripTagLines(src) {
   // included) -- the surrounding spaces and the newline go, the tag itself
   // stays and still runs.
   const lines = src.split('\n');
-  let out = '';
+  const parts = [];
   const tagLineRe = /^[ \t]*(\{%(?:[^%]|%(?!\}))*?%\})[ \t]*$/;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
     const m = tagLineRe.exec(line);
     if (m) {
-      out += m[1];
+      parts.push(m[1]);
     } else {
-      out += line;
-      if (li < lines.length - 1) out += '\n';
+      parts.push(line);
+      if (li < lines.length - 1) parts.push('\n');
     }
   }
-  return out;
+  return parts.join('');
 }
 
 function parseTag(c) {
@@ -452,13 +466,13 @@ function parseTag(c) {
   if (m) {
     const p = m[2].trim();
     if (!isPath(p)) return { error: 'bad path' };
-    return { t: 'for', v: m[1], path: p };
+    return { t: 'for', v: m[1], path: p, parts: p.split('.') };
   }
   m = /^if\s+(not\s+)?(.+)$/.exec(c);
   if (m) {
     const p = m[2].trim();
     if (!isPath(p)) return { error: 'bad path' };
-    return { t: 'if', neg: !!m[1], path: p };
+    return { t: 'if', neg: !!m[1], path: p, parts: p.split('.') };
   }
   m = /^include\s+"([^"]*)"$/.exec(c);
   if (m) return { t: 'include', name: m[1] };
@@ -478,7 +492,7 @@ function tokenize(src) {
       if (i > textStart) toks.push({ t: 'text', s: src.slice(textStart, i) });
       const p = src.slice(i + 3, j).trim();
       if (!isPath(p)) return { error: 'bad path' };
-      toks.push({ t: 'var', path: p, raw: true });
+      toks.push({ t: 'var', path: p, parts: p.split('.'), raw: true });
       i = j + 3;
       textStart = i;
     } else if (src.startsWith('{{', i)) {
@@ -487,7 +501,7 @@ function tokenize(src) {
       if (i > textStart) toks.push({ t: 'text', s: src.slice(textStart, i) });
       const p = src.slice(i + 2, j).trim();
       if (!isPath(p)) return { error: 'bad path' };
-      toks.push({ t: 'var', path: p, raw: false });
+      toks.push({ t: 'var', path: p, parts: p.split('.'), raw: false });
       i = j + 2;
       textStart = i;
     } else if (src.startsWith('{%', i)) {
@@ -518,7 +532,7 @@ function parseSeq(toks, i, stops) {
     if (tk.t === 'for') {
       const r = parseSeq(toks, i + 1, ['endfor']);
       if (r.error) return r;
-      nodes.push({ t: 'for', v: tk.v, path: tk.path, body: r.nodes });
+      nodes.push({ t: 'for', v: tk.v, path: tk.path, parts: tk.parts, body: r.nodes });
       i = r.i + 1;
       continue;
     }
@@ -533,7 +547,7 @@ function parseSeq(toks, i, stops) {
         elseBody = r2.nodes;
         ni = r2.i;
       }
-      nodes.push({ t: 'if', neg: tk.neg, path: tk.path, then: r.nodes, els: elseBody });
+      nodes.push({ t: 'if', neg: tk.neg, path: tk.path, parts: tk.parts, then: r.nodes, els: elseBody });
       i = ni + 1;
       continue;
     }
@@ -555,8 +569,7 @@ function parseTemplate(src) {
   return { ast: r.nodes };
 }
 
-function resolvePath(path, ctx, frames) {
-  const parts = path.split('.');
+function resolvePath(parts, ctx, frames) {
   const first = parts[0];
   let v;
   let found = false;
@@ -599,16 +612,15 @@ function isTruthy(v) {
   return true;
 }
 
-function renderNodes(nodes, ctx, frames, depth, templates) {
-  let out = '';
+function renderNodes(nodes, ctx, frames, depth, templates, out) {
   for (const nd of nodes) {
     if (nd.t === 'text') {
-      out += nd.s;
+      out.push(nd.s);
     } else if (nd.t === 'var') {
-      const w = writeValue(resolvePath(nd.path, ctx, frames));
-      out += nd.raw ? w : esc(w);
+      const w = writeValue(resolvePath(nd.parts, ctx, frames));
+      out.push(nd.raw ? w : esc(w));
     } else if (nd.t === 'for') {
-      const arr = resolvePath(nd.path, ctx, frames);
+      const arr = resolvePath(nd.parts, ctx, frames);
       if (Array.isArray(arr)) {
         for (let k = 0; k < arr.length; k++) {
           const loop = {
@@ -620,21 +632,26 @@ function renderNodes(nodes, ctx, frames, depth, templates) {
           const vars = {};
           vars[nd.v] = arr[k];
           frames.push({ vars, loop });
-          out += renderNodes(nd.body, ctx, frames, depth, templates);
+          renderNodes(nd.body, ctx, frames, depth, templates, out);
           frames.pop();
         }
       }
     } else if (nd.t === 'if') {
-      let truthy = isTruthy(resolvePath(nd.path, ctx, frames));
+      let truthy = isTruthy(resolvePath(nd.parts, ctx, frames));
       if (nd.neg) truthy = !truthy;
-      out += renderNodes(truthy ? nd.then : nd.els || [], ctx, frames, depth, templates);
+      renderNodes(truthy ? nd.then : nd.els || [], ctx, frames, depth, templates, out);
     } else if (nd.t === 'include') {
       if (depth + 1 <= 8 && templates[nd.name]) {
-        out += renderNodes(templates[nd.name], ctx, frames, depth + 1, templates);
+        renderNodes(templates[nd.name], ctx, frames, depth + 1, templates, out);
       }
     }
   }
-  return out;
+}
+
+function renderTemplate(ast, ctx, templates) {
+  const out = [];
+  renderNodes(ast, ctx, [], 0, templates, out);
+  return out.join('');
 }
 
 // ---------- build ----------
@@ -700,7 +717,7 @@ function build(input) {
       continue;
     }
     const dir = isPost ? 'posts' : dirOf(src.path);
-    pages.push({ sourcePath: src.path, dir, isPost, fm, layout, body: fmRes.body });
+    pages.push({ sourcePath: src.path, dir, isPost, fm, layout, bodyLines: fmRes.bodyLines });
   }
 
   // 4. permalinks
@@ -733,12 +750,16 @@ function build(input) {
       base,
       broken,
     };
-    const res = renderMarkdown(p.body, lx);
+    const res = renderMarkdown(p.bodyLines, lx);
     p.content = res.html;
     p.toc = res.toc;
     p.excerpt = res.excerpt;
-    const words = p.body.match(/\S+/g);
-    const wc = words ? words.length : 0;
+    let wc = 0;
+    const wordRe = /\S+/g;
+    for (const line of p.bodyLines) {
+      wordRe.lastIndex = 0;
+      while (wordRe.exec(line) !== null) wc++;
+    }
     p.readingMinutes = Math.max(1, Math.ceil(wc / 200));
   }
 
@@ -757,25 +778,34 @@ function build(input) {
   const tagMap = new Map();
   for (const post of posts) {
     const seen = new Set();
+    const plist = [];
     for (const name of post.fm.tags || []) {
       const s = slugify(name);
       if (seen.has(s)) continue;
       seen.add(s);
-      if (!tagMap.has(s)) {
-        tagMap.set(s, { name, slug: s, url: base + '/tags/' + s + '/', count: 0, posts: [] });
+      let t = tagMap.get(s);
+      if (!t) {
+        t = { name, slug: s, url: base + '/tags/' + s + '/', count: 0, posts: [] };
+        tagMap.set(s, t);
       }
+      t.posts.push(post);
+      t.count++;
+      plist.push({ name: t.name, slug: s, url: t.url });
     }
+    post._tags = plist;
   }
-  for (const post of posts) {
+  for (const p of pages) {
+    if (p.isPost) continue;
     const seen = new Set();
-    for (const name of post.fm.tags || []) {
+    const plist = [];
+    for (const name of p.fm.tags || []) {
       const s = slugify(name);
       if (seen.has(s)) continue;
       seen.add(s);
       const t = tagMap.get(s);
-      t.posts.push(post);
-      t.count++;
+      plist.push({ name: t ? t.name : name, slug: s, url: t ? t.url : '' });
     }
+    p._tags = plist;
   }
   const tags = Array.from(tagMap.values());
   tags.sort((a, b) => {
@@ -785,16 +815,8 @@ function build(input) {
   const tagsCtx = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.count }));
 
   function card(p) {
-    const seen = new Set();
-    const ctags = [];
-    for (const name of p.fm.tags || []) {
-      const s = slugify(name);
-      if (seen.has(s)) continue;
-      seen.add(s);
-      const t = tagMap.get(s);
-      ctags.push({ name: t ? t.name : name, slug: s, url: t ? t.url : '' });
-    }
-    return {
+    if (p._card) return p._card;
+    const c = {
       title: p.fm.title,
       url: p.url,
       date: p.fm.date || '',
@@ -802,8 +824,10 @@ function build(input) {
       summary: p.fm.summary || '',
       excerpt: p.excerpt,
       reading_minutes: p.readingMinutes,
-      tags: ctags,
+      tags: p._tags,
     };
+    p._card = c;
+    return c;
   }
 
   function pageCtx(p) {
@@ -853,7 +877,7 @@ function build(input) {
 
   for (const p of pages) {
     const ctx = { site: siteCtx, tags: tagsCtx, recent, page: pageCtx(p) };
-    out[p.outPath] = renderNodes(parsed[p.layout], ctx, [], 0, parsed);
+    out[p.outPath] = renderTemplate(parsed[p.layout], ctx, parsed);
     if (!p.isPost) nPages++;
     if (p.isPost) nPosts++;
   }
@@ -871,7 +895,7 @@ function build(input) {
         older_url: k < totalPages ? base + '/page/' + (k + 1) + '/' : '',
       };
       const ctx = { site: siteCtx, tags: tagsCtx, recent, posts: slice.map(card), pager };
-      out[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = renderNodes(parsed['index'], ctx, [], 0, parsed);
+      out[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = renderTemplate(parsed['index'], ctx, parsed);
     }
   }
 
@@ -883,14 +907,14 @@ function build(input) {
         recent,
         tag: { name: t.name, slug: t.slug, url: t.url, count: t.count, posts: t.posts.map(card) },
       };
-      out['tags/' + t.slug + '/index.html'] = renderNodes(parsed['tag'], ctx, [], 0, parsed);
+      out['tags/' + t.slug + '/index.html'] = renderTemplate(parsed['tag'], ctx, parsed);
       nTags++;
     }
   }
 
   if (parsed['tags']) {
     const ctx = { site: siteCtx, tags: tagsCtx, recent };
-    out['tags/index.html'] = renderNodes(parsed['tags'], ctx, [], 0, parsed);
+    out['tags/index.html'] = renderTemplate(parsed['tags'], ctx, parsed);
   }
 
   for (const f of statics) {
