@@ -51,29 +51,30 @@ function parseFmValue(k, v) {
   if (k === 'title' || k === 'summary') {
     if (v[0] === '"') {
       const m = /^"((?:\\["\\]|[^"\\])*)"$/.exec(v);
-      if (!m) return { error: 'key "' + k + '" is not a string' };
+      if (!m) return { error: 'key "' + k + '": a quoted string is not closed' };
       return { value: m[1].replace(/\\(["\\])/g, '$1') };
     }
-    if (v[0] === '[') return { error: 'key "' + k + '" is not a string' };
+    if (v[0] === '[') return { error: 'key "' + k + '": a bare string opens on [' };
     return { value: v };
   }
   if (k === 'date') {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return { error: 'key "date" is not a date' };
+    const bad = { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return bad;
     const y = +v.slice(0, 4);
     const mo = +v.slice(5, 7);
     const d = +v.slice(8, 10);
-    if (!isRealDay(y, mo, d)) return { error: 'key "date" is not a date' };
-    if (v < '1970-01-01' || v > '2099-12-31') return { error: 'key "date" is not a date' };
+    if (!isRealDay(y, mo, d)) return bad;
+    if (v < '1970-01-01' || v > '2099-12-31') return bad;
     return { value: v };
   }
   if (k === 'tags') {
-    if (v[0] !== '[' || v[v.length - 1] !== ']') return { error: 'key "tags" is not a list' };
+    if (v[0] !== '[' || v[v.length - 1] !== ']') return { error: 'key "tags": not a list [a, b]' };
     const inner = v.slice(1, -1);
     if (inner === '') return { value: [] };
     const names = inner.split(',').map((s) => s.trim());
     for (const n of names) {
       if (n === '' || n.includes('"') || n.includes('[') || n.includes(']')) {
-        return { error: 'key "tags" is not a list' };
+        return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
       }
     }
     return { value: names };
@@ -81,15 +82,15 @@ function parseFmValue(k, v) {
   if (k === 'draft') {
     if (v === 'true') return { value: true };
     if (v === 'false') return { value: false };
-    return { error: 'key "draft" is not true or false' };
+    return { error: 'key "draft": true or false' };
   }
   if (k === 'layout') {
-    if (!/^[a-z0-9-]+$/.test(v)) return { error: 'key "layout" is not a template name' };
+    if (!/^[a-z0-9-]+$/.test(v)) return { error: 'key "layout": not a template name' };
     return { value: v };
   }
   if (k === 'slug') {
     if (v.length > 64 || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(v)) {
-      return { error: 'key "slug" is not a slug' };
+      return { error: 'key "slug": not a slug' };
     }
     return { value: v };
   }
@@ -109,7 +110,7 @@ function parseFrontMatter(content) {
     const line = lines[j];
     if (/^[ \t]*$/.test(line)) continue;
     if (line[0] === '#') continue;
-    const m = /^([a-z_]+): (.*)$/.exec(line);
+    const m = /^([a-z_]+): ?(.*)$/.exec(line);
     if (!m) return { error: 'line ' + (j + 1) + ' is not "key: value"' };
     const k = m[1];
     const v = m[2].replace(/[ \t]+$/, '');
@@ -202,8 +203,9 @@ function findEmClose(text, from) {
   for (let j = from; j < text.length; j++) {
     if (text[j] === '\\' && j + 1 < text.length) { j++; continue; }
     if (text[j] === '*') {
+      // a `**` pair is a strong delimiter, not an emphasis closer: skip it
+      if (text[j + 1] === '*') { j++; continue; }
       if (j === from) continue;
-      if (text[j - 1] === '*' || text[j + 1] === '*') continue;
       return j;
     }
   }
@@ -252,17 +254,20 @@ function renderInline(text, lx) {
       continue;
     }
     if (c === '*' && text[i + 1] === '*') {
-      const j = findStrongClose(text, i + 2);
-      if (j >= 0) {
-        out += '<strong>' + renderInline(text.slice(i + 2, j), lx) + '</strong>';
-        i = j + 2;
-        continue;
+      if (!(text[i + 2] === '*' && text[i + 3] === '*')) {
+        const j = findStrongClose(text, i + 2);
+        if (j >= 0) {
+          out += '<strong>' + renderInline(text.slice(i + 2, j), lx) + '</strong>';
+          i = j + 2;
+          continue;
+        }
       }
+      // a `**` that does not open strong is itself, both stars at once
       out += '**';
       i += 2;
       continue;
     }
-    if (c === '*' && (i === 0 || text[i - 1] !== '*') && text[i + 1] !== '*') {
+    if (c === '*' && text[i + 1] !== '*') {
       const j = findEmClose(text, i + 1);
       if (j >= 0) {
         out += '<em>' + renderInline(text.slice(i + 1, j), lx) + '</em>';
@@ -399,11 +404,15 @@ function renderMarkdown(body, lx) {
       plines.push(trimEnds(l));
       i++;
     }
-    blocks.push({ html: '<p>' + renderInline(plines.join('\n'), lx) + '</p>', isPara: true });
+    const inner = renderInline(plines.join('\n'), lx);
+    blocks.push({ html: '<p>' + inner + '</p>', isPara: true, inner });
   }
   let html = '';
   for (const b of blocks) html += b.html + '\n';
-  const excerpt = blocks.length > 0 && blocks[0].isPara ? blocks[0].html : '';
+  let excerpt = '';
+  for (const b of blocks) {
+    if (b.isPara) { excerpt = b.inner; break; }
+  }
   return { html, toc, excerpt };
 }
 
@@ -416,14 +425,23 @@ function isPath(p) {
 }
 
 function stripTagLines(src) {
+  // A {% %} tag alone on its line takes the whole line with it (its \n
+  // included) -- the surrounding spaces and the newline go, the tag itself
+  // stays and still runs.
   const lines = src.split('\n');
-  const out = [];
-  const tagLineRe = /^[ \t]*\{%((?:[^%]|%(?!\}))*?)%\}[ \t]*$/;
-  for (const line of lines) {
-    if (tagLineRe.test(line)) continue;
-    out.push(line);
+  let out = '';
+  const tagLineRe = /^[ \t]*(\{%(?:[^%]|%(?!\}))*?%\})[ \t]*$/;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const m = tagLineRe.exec(line);
+    if (m) {
+      out += m[1];
+    } else {
+      out += line;
+      if (li < lines.length - 1) out += '\n';
+    }
   }
-  return out.join('\n');
+  return out;
 }
 
 function parseTag(c) {
@@ -669,12 +687,12 @@ function build(input) {
     }
     const isPost = src.path.startsWith('posts/');
     if (isPost && fm.date === undefined) {
-      report.push('refused ' + src.path + ': no date');
+      report.push('refused ' + src.path + ': a post needs a date');
       continue;
     }
     const layout = fm.layout !== undefined ? fm.layout : isPost ? 'post' : 'page';
     if (!parsed[layout]) {
-      report.push('refused ' + src.path + ': unknown layout "' + layout + '"');
+      report.push('refused ' + src.path + ': layout "' + layout + '" is no template that parses');
       continue;
     }
     if (fm.draft === true) {
@@ -774,7 +792,7 @@ function build(input) {
       if (seen.has(s)) continue;
       seen.add(s);
       const t = tagMap.get(s);
-      ctags.push({ name, slug: s, url: t ? t.url : '' });
+      ctags.push({ name: t ? t.name : name, slug: s, url: t ? t.url : '' });
     }
     return {
       title: p.fm.title,
@@ -836,7 +854,7 @@ function build(input) {
   for (const p of pages) {
     const ctx = { site: siteCtx, tags: tagsCtx, recent, page: pageCtx(p) };
     out[p.outPath] = renderNodes(parsed[p.layout], ctx, [], 0, parsed);
-    nPages++;
+    if (!p.isPost) nPages++;
     if (p.isPost) nPosts++;
   }
 
@@ -854,7 +872,6 @@ function build(input) {
       };
       const ctx = { site: siteCtx, tags: tagsCtx, recent, posts: slice.map(card), pager };
       out[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = renderNodes(parsed['index'], ctx, [], 0, parsed);
-      nPages++;
     }
   }
 
@@ -867,7 +884,6 @@ function build(input) {
         tag: { name: t.name, slug: t.slug, url: t.url, count: t.count, posts: t.posts.map(card) },
       };
       out['tags/' + t.slug + '/index.html'] = renderNodes(parsed['tag'], ctx, [], 0, parsed);
-      nPages++;
       nTags++;
     }
   }
@@ -875,7 +891,6 @@ function build(input) {
   if (parsed['tags']) {
     const ctx = { site: siteCtx, tags: tagsCtx, recent };
     out['tags/index.html'] = renderNodes(parsed['tags'], ctx, [], 0, parsed);
-    nPages++;
   }
 
   for (const f of statics) {
